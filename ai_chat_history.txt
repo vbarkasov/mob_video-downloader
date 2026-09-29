@@ -1,0 +1,274 @@
+# VideoGrabber — техническое задание
+_Файл ведётся как рабочая память проекта. Обновляется после каждой фазы._
+
+Дата составления: 2026-09-29 · Статус: план утверждён, Фаза 0 не начата
+
+---
+
+## 1. Назначение
+
+Мобильное приложение, скачивающее видео из популярных сервисов в галерею телефона.
+- Принимает URL истории или видео и скачивает ролик в системную Галерею.
+- Без серверной части. Вся логика на устройстве.
+- MVP: только YouTube. Архитектура должна позволять лёгкое добавление Instagram, VK, Facebook.
+
+## 2. Зафиксированные продуктовые решения
+
+| Вопрос | Решение |
+|---|---|
+| Фреймворк | Flutter (Android сейчас, iOS позже) |
+| Движок извлечения | yt-dlp через Chaquopy (Python) |
+| Объём MVP | YouTube; остальные сервисы — через реестр |
+| Формат вывода | MP4, склейка bestvideo + bestaudio через ffmpeg |
+| Приём ссылки | Share Intent из других приложений (ACTION_SEND, text/plain) |
+| Буфер обмена | Автопроверка при запуске + кнопка «Вставить» |
+| Дисклеймер | Диалог при первом запуске + постоянный баннер |
+| Рекламная сеть | Яндекс Мобильная реклама, SDK `yandex_mobileads` ^8.5.0 |
+| Баннер | `R-M-20136479-1`, всегда в нижней части экрана |
+| Rewarded | `R-M-20136479-2` |
+| Бесплатный лимит | 1 видео в сутки |
+| Сброс лимита | Полночь по локальному времени устройства |
+| Хранение лимита | SharedPreferences |
+| Если реклама не загрузилась | Fail-safe: разрешаем скачать бесплатно |
+| Счётчик в UI | Показывать пользователю |
+| Текст кнопки | «Скачать» → «Скачать за просмотр рекламы» + иконка видео в конце |
+| Идентификатор пакета | `com.vbsoft.videograbber` |
+| Проверка сборки | debug APK на подключённом эмуляторе |
+
+## 3. Окружение
+
+- Flutter 3.47.5 / Dart 3.13.4 (D:\flutter)
+- Android SDK: platforms 34–36, build-tools 36.0.0, NDK 28.2.13676358 (D:\Android\sdk)
+- JDK 17 (Eclipse Adoptium), Gradle, Python 3.13 (хост), Node, adb
+- Эмулятор: `emulator-5554`, `sdk_gphone64_x86_64`. AVD `compass`.
+- Репозиторий изначально пуст: только `.git`, коммитов нет.
+- Сеть: api.github.com и веб-поиск недоступны; pub.dev, repo1.maven.org, google.com — доступны.
+
+## 4. Зависимости
+
+```yaml
+# pubspec.yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  yandex_mobileads: ^8.5.0
+  shared_preferences: ^2.3.0
+  url_launcher: ^6.3.0      # открыть ссылку на исходное видео
+```
+
+Android: `com.yandex.android:mobileads:8.5.0` (подтягивается плагином с Maven Central).
+Плагин требует `minSdkVersion 23`, `compileSdk 35`.
+
+Chaquopy: плагин `com.chaquo.python`, Python 3.12, pip-зависимость `yt-dlp`.
+
+## 5. Архитектура
+
+Flutter изолирован от конкретных сервисов. Добавление нового сервиса = новый файл в
+`service_registry.dart` + ветка в `url_parser.dart`.
+
+```
+lib/
+  main.dart
+  app.dart
+  core/
+    ad_units.dart              # ID юнитов через --dart-define, с дефолтами
+    theme.dart
+    result.dart
+  domain/
+    models/
+      video_source.dart        # enum VideoSource { youtube, instagram, vk, facebook }
+      video_info.dart          # title, duration, thumbnailUrl, uploader, formats
+      download_job.dart
+    services/
+      service_registry.dart    # ТОЧКА РАСШИРЕНИЯ: id, имя, иконка, домены
+      url_parser.dart          # URL -> VideoSource
+  data/
+    download_api.dart          # MethodChannel + EventChannel
+    download_repository.dart
+    daily_quota_store.dart     # SharedPreferences, сброс в полночь
+    disclaimer_store.dart
+    clipboard_service.dart
+  features/
+    ads/
+      ads_service.dart         # init, баннер, rewarded
+      rewarded_gate.dart       # логика «скачать за просмотр рекламы» + fail-safe
+      bottom_banner.dart       # баннер внизу экрана
+    home/
+      home_screen.dart
+      home_controller.dart
+    disclaimer/
+      disclaimer_dialog.dart
+      disclaimer_banner.dart
+  widgets/
+    url_input.dart
+    download_button.dart
+    quota_label.dart
+
+android/app/src/main/
+  AndroidManifest.xml
+  assets/ffmpeg/arm64-v8a/ffmpeg
+  assets/ffmpeg/x86_64/ffmpeg
+  python/downloader.py         # обёртка yt-dlp, прогресс в stdout
+  kotlin/com/vbsoft/videograbber/
+    MainActivity.kt            # share intent + буфер
+    DownloadBridge.kt          # MethodChannel
+    DownloadService.kt         # ForegroundService + уведомление
+    PythonRunner.kt            # Chaquopy
+    MediaStoreSaver.kt         # запись в MediaStore.Video
+    FfmpegInstaller.kt         # assets -> filesDir/bin, chmod 700
+```
+
+## 6. Контракт MethodChannel
+
+Канал: `com.vbsoft.videograbber/download`
+События: `com.vbsoft.videograbber/download_events` (EventChannel)
+
+| Метод | Вход | Выход |
+|---|---|---|
+| `probe` | `{url}` | `{title, duration, thumbnailUrl, uploader, formats:[{id, ext, height, fps, vcodec, acodec, filesize, note}]}` |
+| `start` | `{url, formatId, jobId}` | `void` |
+| `cancel` | `{jobId}` | `void` |
+| `listJobs` | — | `[...]` |
+
+События: `{jobId, phase, percent, speedBps, etaSec, title, filePath, error}`
+`phase`: `probing | downloading | merging | saving | completed | failed | cancelled`
+
+## 7. Логика лимита и рекламы
+
+```
+Нажатие «Скачать»
+ ├─ квота доступна
+ │    → probe → start загрузки
+ └─ квота израсходована
+      → preload rewarded, показ
+         ├─ onRewarded → start
+         ├─ реклама не загрузилась → fail-safe → start
+         └─ реклама не показалась → fail-safe → start
+Квота списывается ТОЛЬКО по событию completed
+```
+
+Кнопка:
+```dart
+Row([
+  Text(gated ? 'Скачать за просмотр рекламы' : 'Скачать'),
+  if (gated) Icon(Icons.play_circle_outline),
+])
+```
+
+Rewarded-реклама грузится заранее, как только кнопка переходит в платный режим,
+и перезагружается после каждого показа.
+
+API `yandex_mobileads` v8 (проверено по исходникам пакета 8.5.0):
+```dart
+await YandexAds.initialize();
+await YandexAds.setLogging(kDebugMode);
+
+final loader = RewardedAdLoader();
+final ad = await loader.loadAd(adRequest: AdRequest(adUnitId: rewardedUnitId));
+await ad.setAdEventListener(eventListener: RewardedAdEventListener(
+  onRewarded: (Reward reward) {},
+  onAdDismissed: () {},
+  onAdFailedToShow: (AdError error) {},
+));
+await ad.show();
+final Reward? reward = await ad.waitForDismiss();
+await loader.destroy();
+
+final banner = BannerAd(adSize: BannerAdSize.inline(width: 320, maxHeight: 100));
+await banner.load(AdRequest(adUnitId: bannerUnitId));
+// отображение: AdWidget(bannerAd: banner)
+// состояние: banner.loadStateStream -> BannerAdLoadStateLoading / Loaded(w,h) / Error
+```
+`AdRequestError.code` — enum `AdRequestErrorCode` (`noFill`, `networkError`, `systemError`, ...).
+
+## 8. AndroidManifest.xml
+
+Разрешения:
+```
+INTERNET
+FOREGROUND_SERVICE
+FOREGROUND_SERVICE_DATA_SYNC
+POST_NOTIFICATIONS          # Android 13+
+WAKE_LOCK
+WRITE_EXTERNAL_STORAGE      # maxSdkVersion="28"
+```
+`android:usesCleartextTraffic="false"`
+
+Share Intent на MainActivity:
+```xml
+<intent-filter>
+  <action android:name="android.intent.action.SEND" />
+  <category android:name="android.intent.category.DEFAULT" />
+  <data android:mimeType="text/plain" />
+</intent-filter>
+```
+
+Foreground-сервис: `android:foregroundServiceType="dataSync"`, уведомление с прогрессом
+и кнопкой отмены.
+
+## 9. Фазы работ
+
+| Фаза | Содержание | Результат |
+|---|---|---|
+| 0 | Спайк: Chaquopy + yt-dlp на живом YouTube-URL с эмулятора; резолв `com.yandex.android:mobileads` | Выбор ветки по §10 |
+| 1 | Каркас Flutter, тема, экран, поле URL, кнопка, баннер Яндекса | Приложение запускается, баннер внизу |
+| 2 | Android-мост: probe / start / cancel / EventChannel, MediaStore, FGS | Видео скачивается в Галерею с прогрессом |
+| 3 | `daily_quota_store`, состояние кнопки, rewarded-гейт, fail-safe | Работает модель «1 бесплатно в сутки» |
+| 4 | Share Intent + буфер обмена + кнопка «Вставить» | Ссылка приходит извне и из буфера |
+| 5 | Дисклеймер: диалог первого запуска + баннер | Дисклеймер показывается |
+| 6 | ffmpeg, сборка debug APK, установка на эмулятор, сквозной прогон | Работающий APK |
+
+## 10. Риски и ветвление
+
+### R1. YouTube и JS-рантайм (главный риск)
+С 2025 г. YouTube требует JS-дешифровку подписей видеопотоков и PO-токены. Голый yt-dlp
+в Chaquopy (без Node/Deno) часть видео не скачает. Определяется в Фазе 0.
+
+| Результат Фазы 0 | Действие |
+|---|---|
+| Работает из коробки | Идём по плану без изменений |
+| Нужен JS-рантайм | Бандлим QuickJS под Android через NDK, регистрируем в yt-dlp |
+| Нужен PO-токен | YouTube переводится на нативный InnerTube-экстрактор (Kotlin), yt-dlp остаётся для остальных сервисов |
+
+### R2. Реклама не покажется на эмуляторе
+Юниты `R-M-*` работают для зарегистрированной сборки на реальном устройстве.
+На эмуляторе ожидается `noFill` → сработает fail-safe. Для проверки UI:
+переопределение юнитов через `--dart-define` и `YandexAds.showDebugPanel()` в debug.
+
+### R3. Публикация в Google Play
+Скачивание видео нарушает ToS YouTube; гейт за rewarded-рекламу — пограничная практика
+монетизации. Рекомендуется распространение APK вне Google Play. Рекламные сети блокируют
+аккаунты за трафик с нарушающих ToS приложений — юниты держать на отдельном приложении.
+
+### R4. Размер APK ~40–50 МБ
+Python + ffmpeg. Снижается через `abiFilters` до arm64, если не нужна проверка на x86_64.
+
+### R5. Instagram / Facebook (следующие фазы)
+Публичный контент почти всегда требует авторизации. Нужна точка входа для импорта cookies.
+
+### R6. ffmpeg
+Android 10+ запрещает исполнение из world-writable папок → распаковываем в приватный
+`context.filesDir/bin`, `chmod 700`. Источник статической сборки — BtbN/FFmpeg-Builds (GPLv3),
+ссылку и условия лицензирования указать в README.
+
+### R7. Защита лимита
+SharedPreferences обнуляется очисткой данных приложения. Без сервера полноценная защита
+невозможна — это осознанный компромисс MVP.
+
+## 11. Открытые вопросы для Фазы 0
+
+1. Скачивает ли yt-dlp в Chaquopy YouTube-ролик без JS-рантайма?
+2. Какая минимальная длительность ролика допустима (защита от abuse)?
+3. Какой формат выбирать по умолчанию, если пользователь не выбрал качество?
+4. Нужна ли поддержка плейлистов и Shorts в MVP?
+
+## 12. Журнал решений
+
+| Дата | Решение |
+|---|---|
+| 2026-09-29 | Flutter выбран вместо нативного Kotlin — общий код для будущего iOS |
+| 2026-09-29 | yt-dlp через Chaquopy — единый движок на все сервисы |
+| 2026-09-29 | MVP ограничен YouTube, расширение через `service_registry.dart` |
+| 2026-09-29 | Fail-safe при недоступности рекламы — приоритет UX над монетизацией |
+| 2026-09-29 | Лимит 1/сутки, сброс в полночь по локальному времени, хранение в SharedPreferences |
+| 2026-09-29 | Баннер `R-M-20136479-1` постоянно внизу; rewarded `R-M-20136479-2` |
